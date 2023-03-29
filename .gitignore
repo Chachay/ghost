@@ -2,3 +2,7 @@
 */__pycache__/
 .ipynb_checkpoints
 __pycache__
+
+/arcface_model
+/weights/*.pth
+*.onnx

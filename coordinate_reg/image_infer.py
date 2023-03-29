@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
 import os
-import mxnet as mx
+from coordinate_reg.model.M2d106det import KitModel
 from skimage import transform as trans
 import insightface
+import torch
 import sys
 # sys.path.append('/home/jovyan/FaceShifter-2/FaceShifter3/')
 from insightface_func.face_detect_crop_single import Face_detect_crop
@@ -97,85 +98,64 @@ class Handler:
     def __init__(self, prefix, epoch, im_size=192, det_size=224, ctx_id=0, root='./insightface_func/models'):
         print('loading', prefix, epoch)
         if ctx_id >= 0:
-            ctx = mx.gpu(ctx_id)
+            self.ctx = torch.device('cuda:{}'.format(ctx_id))
         else:
-            ctx = mx.cpu()
+            self.ctx = torch.device('cpu')
+
         image_size = (im_size, im_size)
-#         self.detector = insightface.model_zoo.get_model(
-#             'retinaface_mnet025_v2')  #can replace with your own face detector
         self.detector = Face_detect_crop(name='antelope', root=root)
         self.detector.prepare(ctx_id=ctx_id, det_thresh=0.6, det_size=(640,640))
-        #self.detector = insightface.model_zoo.get_model('retinaface_r50_v1')
-        #self.detector.prepare(ctx_id=ctx_id)
         self.det_size = det_size
-        sym, arg_params, aux_params = mx.model.load_checkpoint(prefix, epoch)
-        all_layers = sym.get_internals()
-        sym = all_layers['fc1_output']
         self.image_size = image_size
-        model = mx.mod.Module(symbol=sym, context=ctx, label_names=None)
-        model.bind(for_training=False,
-                   data_shapes=[('data', (1, 3, image_size[0], image_size[1]))
-                                ])
-        model.set_params(arg_params, aux_params)
-        self.model = model
+
+        model = KitModel(os.path.join("coordinate_reg", "model", "M2d106det.npy"))
+        model.eval()
+
+        self.model = model.to(self.ctx)
         self.image_size = image_size
-    
-    
+
+
     def get_without_detection_batch(self, img, M, IM):
-        rimg = kornia.warp_affine(img, M.repeat(img.shape[0],1,1), (192, 192), padding_mode='zeros')
-        rimg = kornia.bgr_to_rgb(rimg)
-        
-        data = mx.nd.array(rimg)
-        db = mx.io.DataBatch(data=(data, ))
-        self.model.forward(db, is_train=False)
-        pred = self.model.get_outputs()[-1].asnumpy()
-        pred = pred.reshape((pred.shape[0], -1, 2))  
-        pred[:, :, 0:2] += 1
-        pred[:, :, 0:2] *= (self.image_size[0] // 2)
-        
-        pred = trans_points2d_batch(pred, IM.repeat(img.shape[0],1,1).numpy())
-        
-        return pred
-    
-    
+        return None
+
     def get_without_detection_without_transform(self, img):
         input_blob = np.zeros((1, 3) + self.image_size, dtype=np.float32)
         rimg = cv2.warpAffine(img, M, self.image_size, borderValue=0.0)
         rimg = cv2.cvtColor(rimg, cv2.COLOR_BGR2RGB)
         rimg = np.transpose(rimg, (2, 0, 1))  #3*112*112, RGB
-        
+
         input_blob[0] = rimg
-        data = mx.nd.array(input_blob)
-        db = mx.io.DataBatch(data=(data, ))
-        self.model.forward(db, is_train=False)
-        pred = self.model.get_outputs()[-1].asnumpy()[0]
-        pred = pred.reshape((-1, 2))
+        input_gpu = torch.from_numpy(input_blob).to(torch.device("cuda:0"))
+
+        with torch.no_grad():
+            pred = self.model(input_gpu)
+
+        pred = pred.to(torch.device("cpu")).reshape((-1, 2))
         pred[:, 0:2] += 1
         pred[:, 0:2] *= (self.image_size[0] // 2)
         pred = trans_points2d(pred, IM)
-        
+
         return pred
-    
-    
+
+
     def get_without_detection(self, img):
         bbox = [0, 0, img.shape[0], img.shape[1]]
         input_blob = np.zeros((1, 3) + self.image_size, dtype=np.float32)
-        
+
         w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
         center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
         rotate = 0
         _scale = self.image_size[0] * 2 / 3.0 / max(w, h)
-        
+
         rimg, M = transform(img, center, self.image_size[0], _scale,
                             rotate)
         rimg = cv2.cvtColor(rimg, cv2.COLOR_BGR2RGB)
         rimg = np.transpose(rimg, (2, 0, 1))  #3*112*112, RGB
-        
         input_blob[0] = rimg
-        data = mx.nd.array(input_blob)
-        db = mx.io.DataBatch(data=(data, ))
-        self.model.forward(db, is_train=False)
-        pred = self.model.get_outputs()[-1].asnumpy()[0]
+        input_gpu = torch.from_numpy(input_blob).to(torch.device("cuda:0"))
+        with torch.no_grad():
+            pred = self.model(input_gpu).to(torch.device("cpu"))
+
         if pred.shape[0] >= 3000:
             pred = pred.reshape((-1, 3))
         else:
@@ -187,10 +167,10 @@ class Handler:
 
         IM = cv2.invertAffineTransform(M)
         pred = trans_points(pred, IM)
-        
+
         return pred
-    
-    
+
+
     def get(self, img, get_all=False):
         out = []
         det_im, det_scale = square_crop(img, self.det_size)
@@ -218,10 +198,9 @@ class Handler:
             rimg = cv2.cvtColor(rimg, cv2.COLOR_BGR2RGB)
             rimg = np.transpose(rimg, (2, 0, 1))  #3*112*112, RGB
             input_blob[0] = rimg
-            data = mx.nd.array(input_blob)
-            db = mx.io.DataBatch(data=(data, ))
-            self.model.forward(db, is_train=False)
-            pred = self.model.get_outputs()[-1].asnumpy()[0]
+            input_gpu = torch.from_numpy(input_blob).to(torch.device("cuda:0"))
+            with torch.no_grad():
+                pred = self.model(input_gpu).to(torch.device("cpu"))
             if pred.shape[0] >= 3000:
                 pred = pred.reshape((-1, 3))
             else:
